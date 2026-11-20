@@ -1,0 +1,914 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Artemis Proxy</title>
+  <meta name="description" content="Artemis Proxy — fast, clean web proxy" />
+  <meta name="theme-color" content="#0b0f1a" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%2360a5fa'/%3E%3Cstop offset='100%25' stop-color='%23a78bfa'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='50' cy='50' r='46' fill='%230b0f1a' stroke='url(%23g)' stroke-width='6'/%3E%3Cpath d='M50 22 L68 70 L50 58 L32 70 Z' fill='url(%23g)'/%3E%3C/svg%3E" />
+  <style>
+    :root {
+      --bg: #070b14;
+      --bg-elevated: #0e1524;
+      --bg-card: rgba(18, 26, 44, 0.72);
+      --border: rgba(148, 163, 184, 0.12);
+      --text: #e8eef9;
+      --muted: #94a3b8;
+      --accent: #60a5fa;
+      --accent-2: #a78bfa;
+      --success: #34d399;
+      --danger: #f87171;
+      --radius: 18px;
+      --shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.55);
+      --font: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html, body {
+      height: 100%;
+    }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      overflow-x: hidden;
+      min-height: 100vh;
+    }
+
+    /* Animated background */
+    .bg {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      overflow: hidden;
+      background:
+        radial-gradient(ellipse 90% 60% at 50% 120%, rgba(30, 58, 138, 0.35), transparent 60%),
+        linear-gradient(180deg, #05080f 0%, var(--bg) 55%, #0a1022 100%);
+    }
+
+    /* Drifting grid (moves with transform, so it stays on the GPU) */
+    .bg-grid {
+      position: absolute;
+      inset: -48px;
+      background-image:
+        linear-gradient(rgba(148, 163, 184, 0.05) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(148, 163, 184, 0.05) 1px, transparent 1px);
+      background-size: 48px 48px;
+      mask-image: radial-gradient(ellipse 75% 65% at 50% 45%, black 10%, transparent 75%);
+      -webkit-mask-image: radial-gradient(ellipse 75% 65% at 50% 45%, black 10%, transparent 75%);
+      animation: gridDrift 24s linear infinite;
+    }
+
+    @keyframes gridDrift {
+      to { transform: translate3d(48px, 48px, 0); }
+    }
+
+    /* Aurora / nebula blobs */
+    .aurora {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(90px);
+      mix-blend-mode: screen;
+      opacity: 0.4;
+      will-change: transform;
+    }
+
+    .aurora-1 {
+      width: 52vmax;
+      height: 52vmax;
+      top: -22vmax;
+      left: -14vmax;
+      background: radial-gradient(circle at 40% 40%, #3b82f6, transparent 65%);
+      animation: driftA 26s ease-in-out infinite alternate;
+    }
+
+    .aurora-2 {
+      width: 46vmax;
+      height: 46vmax;
+      top: 18%;
+      right: -18vmax;
+      background: radial-gradient(circle at 50% 50%, #8b5cf6, transparent 65%);
+      animation: driftB 32s ease-in-out infinite alternate;
+    }
+
+    .aurora-3 {
+      width: 40vmax;
+      height: 40vmax;
+      bottom: -20vmax;
+      left: 12%;
+      background: radial-gradient(circle at 50% 50%, #06b6d4, transparent 65%);
+      opacity: 0.28;
+      animation: driftC 38s ease-in-out infinite alternate;
+    }
+
+    .aurora-4 {
+      width: 30vmax;
+      height: 30vmax;
+      top: 45%;
+      left: -10vmax;
+      background: radial-gradient(circle at 50% 50%, #ec4899, transparent 65%);
+      opacity: 0.16;
+      animation: driftB 44s ease-in-out infinite alternate-reverse;
+    }
+
+    @keyframes driftA {
+      0%   { transform: translate3d(0, 0, 0) scale(1) rotate(0deg); }
+      50%  { transform: translate3d(8vmax, 6vmax, 0) scale(1.12) rotate(20deg); }
+      100% { transform: translate3d(2vmax, 12vmax, 0) scale(0.95) rotate(-10deg); }
+    }
+
+    @keyframes driftB {
+      0%   { transform: translate3d(0, 0, 0) scale(1); }
+      50%  { transform: translate3d(-10vmax, -5vmax, 0) scale(1.15); }
+      100% { transform: translate3d(-4vmax, 8vmax, 0) scale(0.92); }
+    }
+
+    @keyframes driftC {
+      0%   { transform: translate3d(0, 0, 0) scale(1); }
+      50%  { transform: translate3d(12vmax, -6vmax, 0) scale(1.1); }
+      100% { transform: translate3d(-6vmax, -2vmax, 0) scale(1.2); }
+    }
+
+    /* Starfield + shooting stars + cursor glow are drawn on this canvas */
+    #stars {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }
+
+    /* Soft vignette keeps the card readable */
+    .bg-vignette {
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse 85% 75% at 50% 45%, transparent 40%, rgba(3, 5, 10, 0.65) 100%);
+      pointer-events: none;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .bg-grid, .aurora { animation: none; }
+    }
+
+    /* Layout */
+    .shell {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 2.5rem 1.25rem 3rem;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 2.25rem;
+      animation: fadeUp 0.7s ease both;
+    }
+
+    .logo {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .logo-mark {
+      width: 48px;
+      height: 48px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+      display: grid;
+      place-items: center;
+      box-shadow: 0 8px 24px rgba(59, 130, 246, 0.35);
+    }
+
+    .logo-mark svg {
+      width: 26px;
+      height: 26px;
+    }
+
+    .logo-text {
+      font-size: 1.65rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      background: linear-gradient(135deg, #e0e7ff, #c4b5fd);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .tagline {
+      color: var(--muted);
+      font-size: 0.95rem;
+      max-width: 360px;
+      margin: 0 auto;
+    }
+
+    /* Main card */
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: calc(var(--radius) + 4px);
+      padding: 1.75rem;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      animation: fadeUp 0.7s ease 0.1s both;
+    }
+
+    .search-form {
+      display: flex;
+      gap: 0.6rem;
+      margin-bottom: 1.25rem;
+    }
+
+    .input-wrap {
+      flex: 1;
+      position: relative;
+    }
+
+    .input-wrap svg {
+      position: absolute;
+      left: 14px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 18px;
+      height: 18px;
+      color: var(--muted);
+      pointer-events: none;
+    }
+
+    input[type="text"] {
+      width: 100%;
+      padding: 0.9rem 1rem 0.9rem 2.7rem;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: rgba(7, 11, 20, 0.65);
+      color: var(--text);
+      font-size: 0.95rem;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+
+    input[type="text"]::placeholder {
+      color: #64748b;
+    }
+
+    input[type="text"]:focus {
+      border-color: rgba(96, 165, 250, 0.5);
+      box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.15);
+    }
+
+    .go-btn {
+      padding: 0 1.35rem;
+      border: none;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      color: white;
+      font-weight: 600;
+      font-size: 0.95rem;
+      font-family: inherit;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      transition: transform 0.15s, box-shadow 0.2s, filter 0.2s;
+      box-shadow: 0 4px 14px rgba(59, 130, 246, 0.35);
+      white-space: nowrap;
+    }
+
+    .go-btn:hover {
+      transform: translateY(-1px);
+      filter: brightness(1.08);
+      box-shadow: 0 6px 20px rgba(59, 130, 246, 0.45);
+    }
+
+    .go-btn:active {
+      transform: translateY(0);
+    }
+
+    .go-btn svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    /* Quick links */
+    .section-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 0.65rem;
+      font-weight: 600;
+    }
+
+    .quick-links {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 0.55rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .quick-link {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      padding: 0.65rem 0.8rem;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: rgba(7, 11, 20, 0.45);
+      color: var(--text);
+      text-decoration: none;
+      font-size: 0.875rem;
+      transition: background 0.15s, border-color 0.15s, transform 0.15s;
+      cursor: pointer;
+    }
+
+    .quick-link:hover {
+      background: rgba(96, 165, 250, 0.1);
+      border-color: rgba(96, 165, 250, 0.3);
+      transform: translateY(-1px);
+    }
+
+    .quick-link .icon {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      font-size: 0.9rem;
+      flex-shrink: 0;
+    }
+
+    .quick-link .icon.yt { background: rgba(255, 0, 0, 0.15); }
+    .quick-link .icon.rd { background: rgba(255, 69, 0, 0.15); }
+    .quick-link .icon.gh { background: rgba(255, 255, 255, 0.08); }
+    .quick-link .icon.dc { background: rgba(88, 101, 242, 0.18); }
+    .quick-link .icon.tw { background: rgba(29, 155, 240, 0.15); }
+    .quick-link .icon.gg { background: rgba(66, 133, 244, 0.15); }
+
+    /* Features */
+    .features {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.65rem;
+    }
+
+    @media (max-width: 520px) {
+      .features { grid-template-columns: 1fr; }
+      .search-form { flex-direction: column; }
+      .go-btn { justify-content: center; padding: 0.9rem; }
+    }
+
+    .feature {
+      display: flex;
+      gap: 0.65rem;
+      padding: 0.85rem;
+      border-radius: 12px;
+      background: rgba(7, 11, 20, 0.35);
+      border: 1px solid var(--border);
+    }
+
+    .feature-icon {
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, rgba(96, 165, 250, 0.2), rgba(167, 139, 250, 0.2));
+      display: grid;
+      place-items: center;
+      flex-shrink: 0;
+      color: var(--accent);
+    }
+
+    .feature-icon svg {
+      width: 18px;
+      height: 18px;
+    }
+
+    .feature h3 {
+      font-size: 0.875rem;
+      font-weight: 600;
+      margin-bottom: 0.15rem;
+    }
+
+    .feature p {
+      font-size: 0.75rem;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+
+    /* Footer */
+    footer {
+      margin-top: auto;
+      padding-top: 2.5rem;
+      text-align: center;
+      color: var(--muted);
+      font-size: 0.8rem;
+      animation: fadeUp 0.7s ease 0.2s both;
+    }
+
+    footer a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    footer a:hover {
+      text-decoration: underline;
+    }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      margin-top: 0.75rem;
+      padding: 0.35rem 0.75rem;
+      border-radius: 999px;
+      background: rgba(52, 211, 153, 0.1);
+      border: 1px solid rgba(52, 211, 153, 0.25);
+      color: var(--success);
+      font-size: 0.75rem;
+      font-weight: 500;
+    }
+
+    .status.offline {
+      background: rgba(248, 113, 113, 0.1);
+      border-color: rgba(248, 113, 113, 0.25);
+      color: var(--danger);
+    }
+
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+      animation: pulse 2s ease infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    @keyframes fadeUp {
+      from {
+        opacity: 0;
+        transform: translateY(16px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    /* Error toast */
+    .toast {
+      position: fixed;
+      bottom: 1.5rem;
+      left: 50%;
+      transform: translateX(-50%) translateY(80px);
+      background: #1e293b;
+      color: #f1f5f9;
+      padding: 0.75rem 1.25rem;
+      border-radius: 12px;
+      border: 1px solid rgba(248, 113, 113, 0.35);
+      font-size: 0.875rem;
+      box-shadow: var(--shadow);
+      opacity: 0;
+      transition: all 0.3s ease;
+      z-index: 100;
+      max-width: 90vw;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+  </style>
+</head>
+<body>
+  <div class="bg" aria-hidden="true">
+    <div class="bg-grid"></div>
+    <div class="aurora aurora-1"></div>
+    <div class="aurora aurora-2"></div>
+    <div class="aurora aurora-3"></div>
+    <div class="aurora aurora-4"></div>
+    <canvas id="stars"></canvas>
+    <div class="bg-vignette"></div>
+  </div>
+
+  <div class="shell">
+    <header>
+      <div class="logo">
+        <div class="logo-mark">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"/>
+          </svg>
+        </div>
+        <span class="logo-text">Artemis Proxy</span>
+      </div>
+      <p class="tagline">Fast, clean, and private web access. Type a URL or search and go.</p>
+    </header>
+
+    <main class="card">
+      <form class="search-form" id="proxyForm" autocomplete="off">
+        <div class="input-wrap">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>
+          </svg>
+          <input
+            type="text"
+            id="urlInput"
+            placeholder="Enter URL or search…"
+            spellcheck="false"
+            autofocus
+          />
+        </div>
+        <button type="submit" class="go-btn">
+          Go
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+          </svg>
+        </button>
+      </form>
+
+      <p class="section-label">Quick access</p>
+      <div class="quick-links" id="quickLinks">
+        <button type="button" class="quick-link" data-url="https://www.youtube.com">
+          <span class="icon yt">▶</span>
+          <span>YouTube</span>
+        </button>
+        <button type="button" class="quick-link" data-url="https://old.reddit.com">
+          <span class="icon rd">◈</span>
+          <span>Reddit (Old)</span>
+        </button>
+        <button type="button" class="quick-link" data-url="https://github.com">
+          <span class="icon gh">⌘</span>
+          <span>GitHub</span>
+        </button>
+        <button type="button" class="quick-link" data-url="https://discord.com">
+          <span class="icon dc">◆</span>
+          <span>Discord</span>
+        </button>
+        <button type="button" class="quick-link" data-url="https://x.com">
+          <span class="icon tw">✕</span>
+          <span>X / Twitter</span>
+        </button>
+        <button type="button" class="quick-link" data-url="https://duckduckgo.com">
+          <span class="icon gg">🦆</span>
+          <span>DuckDuckGo</span>
+        </button>
+        <button type="button" class="quick-link" data-url="https://search.brave.com">
+          <span class="icon gg">🦁</span>
+          <span>Brave Search</span>
+        </button>
+      </div>
+
+      <p class="section-label">Why Artemis</p>
+      <div class="features">
+        <div class="feature">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+          </div>
+          <div>
+            <h3>Streaming fast</h3>
+            <p>Low-latency transport with smart rewriting for a smooth experience.</p>
+          </div>
+        </div>
+        <div class="feature">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          </div>
+          <div>
+            <h3>Privacy focused</h3>
+            <p>Your traffic is proxied. No tracking scripts on this page.</p>
+          </div>
+        </div>
+        <div class="feature">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </div>
+          <div>
+            <h3>Account friendly</h3>
+            <p>Works with sites that need logins (GitHub and more).</p>
+          </div>
+        </div>
+        <div class="feature">
+          <div class="feature-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+          </div>
+          <div>
+            <h3>Ad-aware</h3>
+            <p>Built-in ad blocking helps keep pages cleaner and lighter.</p>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <footer>
+      <p>Artemis Proxy · Powered by a modern streaming backend</p>
+      <div class="status" id="statusBadge">
+        <span class="status-dot"></span>
+        <span id="statusText">Checking backend…</span>
+      </div>
+    </footer>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    // ========== CONFIG ==========
+    // Change this if your proxy endpoint is different.
+    // Default matches the Artemis-rebranded backend: /artemis?url=
+    const PROXY_ENDPOINT = "/artemis?url=";
+    // Health check path (optional)
+    const HEALTH_PATH = "/health";
+    // ============================
+
+    const form = document.getElementById("proxyForm");
+    const input = document.getElementById("urlInput");
+    const toast = document.getElementById("toast");
+    const statusBadge = document.getElementById("statusBadge");
+    const statusText = document.getElementById("statusText");
+
+    function showToast(msg) {
+      toast.textContent = msg;
+      toast.classList.add("show");
+      clearTimeout(showToast._t);
+      showToast._t = setTimeout(() => toast.classList.remove("show"), 3200);
+    }
+
+    function isProbablyUrl(value) {
+      const v = value.trim();
+      if (!v) return false;
+      // Has protocol
+      if (/^https?:\/\//i.test(v)) return true;
+      // Looks like domain (has a dot, no spaces)
+      if (/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+(\/.*)?$/i.test(v) && !/\s/.test(v)) {
+        return true;
+      }
+      return false;
+    }
+
+    function buildTarget(raw) {
+      let value = raw.trim();
+      if (!value) return null;
+
+      if (isProbablyUrl(value)) {
+        if (!/^https?:\/\//i.test(value)) {
+          value = "https://" + value;
+        }
+        try {
+          new URL(value);
+          return value;
+        } catch {
+          return null;
+        }
+      }
+
+      // Treat as search
+      return "https://duckduckgo.com/?q=" + encodeURIComponent(value);
+    }
+
+    function go(url) {
+      const target = buildTarget(url);
+      if (!target) {
+        showToast("Please enter a valid URL or search term.");
+        return;
+      }
+      // Navigate through the proxy
+      window.location.href = PROXY_ENDPOINT + encodeURIComponent(target);
+    }
+
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      go(input.value);
+    });
+
+    document.getElementById("quickLinks").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-url]");
+      if (!btn) return;
+      go(btn.dataset.url);
+    });
+
+    // Backend health check
+    async function checkHealth() {
+      try {
+        const res = await fetch(HEALTH_PATH, { cache: "no-store" });
+        if (res.ok) {
+          statusBadge.classList.remove("offline");
+          statusText.textContent = "Backend online";
+          return;
+        }
+      } catch (_) {}
+      statusBadge.classList.add("offline");
+      statusText.textContent = "Backend offline — start the server";
+    }
+
+    checkHealth();
+  </script>
+
+  <script>
+    // ========== ANIMATED BACKGROUND ==========
+    // Parallax starfield, twinkling, shooting stars and a soft cursor glow.
+    // Pauses when the tab is hidden and respects prefers-reduced-motion.
+    (() => {
+      const canvas = document.getElementById("stars");
+      const ctx = canvas.getContext("2d");
+      const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+      const TAU = Math.PI * 2;
+
+      let w = 0, h = 0, dpr = 1;
+      let stars = [];
+      let shooters = [];
+      let nextShooter = 2500;
+      let rafId = 0;
+      let last = 0;
+      const mouse = { x: 0, y: 0, tx: 0, ty: 0, px: -999, py: -999, active: false };
+
+      const COLORS = [
+        [210, 90, 88],  // icy blue
+        [250, 80, 90],  // soft violet
+        [190, 85, 88],  // cyan
+        [0, 0, 100]     // white
+      ];
+
+      function resize() {
+        dpr = Math.min(window.devicePixelRatio || 1, 2);
+        w = window.innerWidth;
+        h = window.innerHeight;
+        canvas.width = Math.round(w * dpr);
+        canvas.height = Math.round(h * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        seed();
+        if (reduceMotion.matches) draw(0);
+      }
+
+      function seed() {
+        const count = Math.max(70, Math.min(260, Math.round((w * h) / 9000)));
+        stars = Array.from({ length: count }, () => {
+          const z = Math.pow(Math.random(), 1.6); // most stars are far away
+          const c = COLORS[(Math.random() * COLORS.length) | 0];
+          return {
+            x: Math.random() * w,
+            y: Math.random() * h,
+            z,
+            r: 0.35 + z * 1.35,
+            speed: 2 + z * 9,                 // px/sec drift
+            phase: Math.random() * TAU,
+            twinkle: 0.4 + Math.random() * 1.4,
+            c
+          };
+        });
+      }
+
+      function spawnShooter() {
+        const fromTop = Math.random() < 0.7;
+        const angle = (Math.PI / 180) * (18 + Math.random() * 22); // downward, to the right
+        shooters.push({
+          x: fromTop ? Math.random() * w * 0.8 : -40,
+          y: fromTop ? -40 : Math.random() * h * 0.4,
+          angle,
+          speed: 650 + Math.random() * 450,
+          len: 110 + Math.random() * 120,
+          life: 0,
+          max: 1.1 + Math.random() * 0.6
+        });
+      }
+
+      function draw(t) {
+        ctx.clearRect(0, 0, w, h);
+
+        // ease parallax toward the pointer
+        mouse.x += (mouse.tx - mouse.x) * 0.05;
+        mouse.y += (mouse.ty - mouse.y) * 0.05;
+
+        const time = t / 1000;
+        for (const s of stars) {
+          const px = s.x + mouse.x * s.z * 28;
+          const py = s.y + mouse.y * s.z * 28;
+          const a = 0.3 + 0.7 * (0.5 + 0.5 * Math.sin(s.phase + time * s.twinkle));
+          const [hh, ss, ll] = s.c;
+
+          // brighten stars near the cursor
+          let boost = 0;
+          if (mouse.active) {
+            const dx = px - mouse.px, dy = py - mouse.py;
+            const d2 = dx * dx + dy * dy;
+            if (d2 < 22500) boost = 1 - d2 / 22500;
+          }
+
+          const alpha = Math.min(1, a * (0.45 + s.z * 0.55) + boost * 0.5);
+          ctx.fillStyle = `hsla(${hh}, ${ss}%, ${ll}%, ${alpha})`;
+          ctx.beginPath();
+          ctx.arc(px, py, s.r * (1 + boost * 0.6), 0, TAU);
+          ctx.fill();
+
+          // faint halo on the closest stars
+          if (s.z > 0.8) {
+            ctx.fillStyle = `hsla(${hh}, ${ss}%, ${ll}%, ${alpha * 0.14})`;
+            ctx.beginPath();
+            ctx.arc(px, py, s.r * 3.4, 0, TAU);
+            ctx.fill();
+          }
+        }
+
+        // cursor glow
+        if (mouse.active) {
+          const g = ctx.createRadialGradient(mouse.px, mouse.py, 0, mouse.px, mouse.py, 220);
+          g.addColorStop(0, "rgba(96, 165, 250, 0.10)");
+          g.addColorStop(1, "rgba(96, 165, 250, 0)");
+          ctx.fillStyle = g;
+          ctx.fillRect(mouse.px - 220, mouse.py - 220, 440, 440);
+        }
+
+        // shooting stars
+        for (const m of shooters) {
+          const dirX = Math.cos(m.angle), dirY = Math.sin(m.angle);
+          const hx = m.x + dirX * m.speed * m.life;
+          const hy = m.y + dirY * m.speed * m.life;
+          const fade = Math.sin(Math.min(1, m.life / m.max) * Math.PI);
+          const tx = hx - dirX * m.len;
+          const ty = hy - dirY * m.len;
+          const g = ctx.createLinearGradient(tx, ty, hx, hy);
+          g.addColorStop(0, "rgba(167, 139, 250, 0)");
+          g.addColorStop(1, `rgba(224, 231, 255, ${0.9 * fade})`);
+          ctx.strokeStyle = g;
+          ctx.lineWidth = 1.6;
+          ctx.lineCap = "round";
+          ctx.beginPath();
+          ctx.moveTo(tx, ty);
+          ctx.lineTo(hx, hy);
+          ctx.stroke();
+          ctx.fillStyle = `rgba(255, 255, 255, ${fade})`;
+          ctx.beginPath();
+          ctx.arc(hx, hy, 1.7, 0, TAU);
+          ctx.fill();
+        }
+      }
+
+      function update(dt) {
+        for (const s of stars) {
+          s.y -= s.speed * dt;       // slow upward drift
+          s.x += s.speed * 0.25 * dt; // slight sideways drift
+          if (s.y < -4) { s.y = h + 4; s.x = Math.random() * w; }
+          if (s.x > w + 4) s.x = -4;
+        }
+
+        nextShooter -= dt * 1000;
+        if (nextShooter <= 0) {
+          if (shooters.length < 2) spawnShooter();
+          nextShooter = 4000 + Math.random() * 6500;
+        }
+        for (const m of shooters) m.life += dt;
+        shooters = shooters.filter(m => m.life < m.max);
+      }
+
+      function loop(now) {
+        const dt = Math.min((now - last) / 1000 || 0, 0.05);
+        last = now;
+        update(dt);
+        draw(now);
+        rafId = requestAnimationFrame(loop);
+      }
+
+      function start() {
+        if (rafId || reduceMotion.matches || document.hidden) return;
+        last = performance.now();
+        rafId = requestAnimationFrame(loop);
+      }
+
+      function stop() {
+        cancelAnimationFrame(rafId);
+        rafId = 0;
+      }
+
+      window.addEventListener("resize", resize);
+      window.addEventListener("pointermove", (e) => {
+        mouse.tx = (e.clientX / w - 0.5) * 2;
+        mouse.ty = (e.clientY / h - 0.5) * 2;
+        mouse.px = e.clientX;
+        mouse.py = e.clientY;
+        mouse.active = e.pointerType !== "touch";
+      }, { passive: true });
+      document.addEventListener("pointerleave", () => { mouse.active = false; });
+      document.addEventListener("visibilitychange", () => (document.hidden ? stop() : start()));
+      reduceMotion.addEventListener("change", () => {
+        if (reduceMotion.matches) { stop(); draw(0); } else start();
+      });
+
+      resize();
+      start();
+    })();
+    // ========== END ANIMATED BACKGROUND ==========
+  </script>
+</body>
+</html>

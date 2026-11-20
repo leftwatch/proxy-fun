@@ -1,0 +1,61 @@
+const workerScript = `
+const workerUrl = new URL(self.location.href);
+const server = workerUrl.searchParams.get("server") || "";
+const endpoint = server
+  ? "/artemis?server=" + encodeURIComponent(server) + "&url="
+  : "/artemis?url=";
+const target = workerUrl.searchParams.get("target");
+
+self.addEventListener("install", event => event.waitUntil(self.skipWaiting()));
+self.addEventListener("activate", event => event.waitUntil(self.clients.claim()));
+
+self.addEventListener("fetch", event => {
+  const request = event.request;
+  if (!target || !/^(?:GET|HEAD)$/i.test(request.method)) return;
+
+  const url = new URL(request.url);
+  const internalPaths = new Set([
+    "/service-worker.js",
+    "/favicon",
+    "/api/icon",
+    "/health",
+    "/robots.txt",
+    "/artemis"
+  ]);
+
+  if (url.origin === self.location.origin && internalPaths.has(url.pathname)) return;
+
+  let upstream;
+  try {
+    const base = new URL(target);
+    upstream = url.origin === self.location.origin
+      ? new URL(url.pathname + url.search + url.hash, base).href
+      : url.href;
+    const upstreamUrl = new URL(upstream);
+    const pageHost = base.hostname.toLowerCase();
+    const proxyHost = self.location.hostname.toLowerCase();
+    if ((pageHost === "roblox.com" || pageHost.endsWith(".roblox.com")) &&
+        upstreamUrl.hostname.endsWith("." + proxyHost)) {
+      const subdomain = upstreamUrl.hostname.slice(0, -(proxyHost.length + 1));
+      if (subdomain && !subdomain.includes(".")) upstreamUrl.hostname = subdomain + ".roblox.com";
+    }
+    upstream = upstreamUrl.href;
+  } catch {
+    return;
+  }
+
+  const proxied = endpoint + encodeURIComponent(upstream);
+  event.respondWith(fetch(new Request(proxied, request)));
+});
+`;
+
+export function serviceWorkerResponse() {
+  return new Response(workerScript, {
+    status: 200,
+    headers: {
+      "content-type": "application/javascript; charset=utf-8",
+      "cache-control": "no-store",
+      "service-worker-allowed": "/"
+    }
+  });
+}

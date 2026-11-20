@@ -1,0 +1,314 @@
+import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { request } from "undici";
+import { WebSocketServer, WebSocket } from "ws";
+import { server as wisp } from "@mercuryworkshop/wisp-js/server";
+import { validateTarget, validateRedirect } from "./policy.js";
+import { resolveProxyTarget } from "./proxy-target.js";
+import { requestHeaders, responseHeaders } from "./headers.js";
+import { rewriteCss, rewriteHtml, rewriteWorkerScript } from "./rewriter.js";
+import { runtimeScript } from "./runtime.js";
+import { serviceWorkerResponse } from "./service-worker.js";
+import { fetchSiteIcon } from "./icon.js";
+import { adblockerScript } from "./adblocker.js";
+
+const port = Number(process.env.PORT) || 8080;
+const timeout = Number(process.env.UPSTREAM_TIMEOUT) || 30000;
+const maxRedirects = Number(process.env.MAX_REDIRECTS) || 8;
+const maxRewriteSize = Number(process.env.MAX_REWRITE_SIZE) || 256 * 1024 * 1024;
+const maxHeaderSize = Number(process.env.MAX_HEADER_SIZE) || 32768;
+const maxWebSocketPayload = Number(process.env.MAX_WS_PAYLOAD) || 16 * 1024 * 1024;
+const allowPrivate = process.env.ALLOW_PRIVATE_TARGETS === "true";
+const rewriteEnabled = process.env.REWRITE !== "false";
+const endpoint = process.env.PROXY_ENDPOINT || "/artemis?url=";
+const wispPath = process.env.WISP_PATH || "/wisp/";
+
+wisp.options.allow_private_ips = allowPrivate;
+wisp.options.allow_loopback_ips = allowPrivate;
+
+const server = http.createServer({ maxHeaderSize }, handleRequest);
+const wss = new WebSocketServer({ noServer: true, maxPayload: maxWebSocketPayload });
+
+function sendError(res, status, message) {
+  if (res.headersSent) return res.destroy();
+  res.writeHead(status, {
+    "content-type": "text/plain; charset=utf-8",
+    "cache-control": "no-store",
+    "x-robots-tag": "noindex, nofollow, noarchive",
+    "access-control-allow-origin": "*"
+  });
+  res.end(message);
+}
+
+function canRewrite(headers) {
+  const type = String(headers["content-type"] || "").toLowerCase();
+  return rewriteEnabled && (type.includes("text/html") || type.includes("text/css") || type.includes("javascript"));
+}
+
+function bodyBuffer(stream, limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let exceeded = false;
+    stream.on("data", chunk => {
+      if (exceeded) return;
+      size += chunk.length;
+      if (size > limit) {
+        exceeded = true;
+        stream.destroy();
+        resolve(null);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    stream.on("end", () => { if (!exceeded) resolve(Buffer.concat(chunks)); });
+    stream.on("error", reject);
+  });
+}
+
+async function streamBuffer(res, buffer) {
+  const chunkSize = 64 * 1024;
+  for (let offset = 0; offset < buffer.length; offset += chunkSize) {
+    const chunk = buffer.subarray(offset, Math.min(offset + chunkSize, buffer.length));
+    if (!res.write(chunk)) await new Promise(resolve => res.once("drain", resolve));
+  }
+}
+
+function proxyOrigin(req) {
+  const protocol = req.headers["x-forwarded-proto"] || (req.socket.encrypted ? "https" : "http");
+  const host = req.headers["x-forwarded-host"] || req.headers.host || "localhost";
+  return protocol + "://" + host;
+}
+
+function proxyEndpoint(req) {
+  const origin = proxyOrigin(req);
+  const requestUrl = new URL(req.url, origin);
+  const server = requestUrl.searchParams.get("server");
+  if (!server) return new URL(endpoint, origin).href;
+  const endpointUrl = new URL(endpoint, origin);
+  return `${endpointUrl.origin}${endpointUrl.pathname}?server=${encodeURIComponent(server)}&url=`;
+}
+
+function proxiedRedirect(location, base, req) {
+  const absolute = new URL(location, base);
+  const destination = new URL(endpoint, proxyOrigin(req));
+  destination.searchParams.set("url", absolute.href);
+  const requestUrl = new URL(req.url, proxyOrigin(req));
+  const redirects = Number(requestUrl.searchParams.get("__artemis_redirects")) || 0;
+  if (redirects < maxRedirects) destination.searchParams.set("__artemis_redirects", String(redirects + 1));
+  return destination.href;
+}
+
+async function proxyRequest(req, res, target, redirects = 0) {
+  if (redirects > maxRedirects) return sendError(res, 508, "Too many redirects");
+  const allowed = await validateTarget(target.href, allowPrivate);
+  if (!allowed) return sendError(res, 403, "Target is not allowed");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  const headers = requestHeaders(req.headers, target);
+  if (rewriteEnabled) headers["accept-encoding"] = "identity";
+  try {
+    const upstream = await request(target, {
+      method: req.method,
+      headers,
+      body: req.method === "GET" || req.method === "HEAD" ? null : req,
+      signal: controller.signal,
+      maxRedirections: 0,
+      headersTimeout: timeout,
+      bodyTimeout: 0
+    });
+    const location = upstream.headers.location;
+
+    const rewrittenResponse = canRewrite(upstream.headers);
+    const headersOut = responseHeaders(upstream.headers, { rewritten: rewrittenResponse, targetHost: target.hostname });
+    if (location) {
+      const redirect = await validateRedirect(location, target, allowPrivate);
+      if (!redirect) return sendError(res, 403, "Redirect target is not allowed");
+      headersOut.location = proxiedRedirect(location, target, req);
+    }
+
+    if (!rewrittenResponse || [204, 304].includes(upstream.statusCode)) {
+      res.writeHead(upstream.statusCode, headersOut);
+      upstream.body.on("error", () => res.destroy());
+      upstream.body.pipe(res);
+      return;
+    }
+
+    const body = await bodyBuffer(upstream.body, maxRewriteSize);
+    if (body === null) return sendError(res, 413, `Response exceeds rewrite limit (${Math.floor(maxRewriteSize / 1024 / 1024)} MiB)`);
+    const type = String(upstream.headers["content-type"] || "").toLowerCase();
+    const source = body.toString("utf8");
+    const absoluteEndpoint = proxyEndpoint(req);
+    const iconUrl = new URL("/favicon", proxyOrigin(req));
+    iconUrl.searchParams.set("url", target.href);
+    const iconHref = type.includes("text/html") ? iconUrl.href : "";
+    const rewritten = type.includes("text/css")
+      ? rewriteCss(source, target.href, absoluteEndpoint)
+      : type.includes("javascript")
+        ? rewriteWorkerScript(source, target.href, absoluteEndpoint)
+        : rewriteHtml(
+  source,
+  target.href,
+  absoluteEndpoint,
+  runtimeScript(
+    absoluteEndpoint,
+    "/service-worker.js",
+    target.href
+  ) + adblockerScript(),
+  iconHref
+);
+    const output = Buffer.from(rewritten, "utf8");
+    delete headersOut["content-length"];
+    delete headersOut["content-encoding"];
+    res.writeHead(upstream.statusCode, headersOut);
+    await streamBuffer(res, output);
+    res.end();
+  } catch (error) {
+    sendError(res, error.name === "AbortError" ? 504 : 502, error.name === "AbortError" ? "Upstream request timed out" : "Unable to reach upstream");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function handleWebSocket(req, socket, head) {
+  const requestUrl = new URL(req.url, "http://localhost");
+  const rawTarget = requestUrl.searchParams.get("url");
+  wss.handleUpgrade(req, socket, head, async client => {
+    const target = await validateTarget(rawTarget, allowPrivate);
+    if (!target) return client.close(1008, "Target is not allowed");
+    target.protocol = target.protocol === "https:" ? "wss:" : "ws:";
+    const upstream = new WebSocket(target, {
+      headers: requestHeaders(req.headers, target),
+      handshakeTimeout: timeout,
+      maxPayload: maxWebSocketPayload
+    });
+    let closed = false;
+    const closeBoth = (code = 1000, reason = "") => {
+      if (closed) return;
+      closed = true;
+      if (client.readyState === WebSocket.OPEN) client.close(code, reason); else client.terminate();
+      if (upstream.readyState === WebSocket.OPEN) upstream.close(code, reason); else if (upstream.readyState === WebSocket.CONNECTING) upstream.terminate();
+    };
+    upstream.on("open", () => { if (client.readyState !== WebSocket.OPEN) closeBoth(); });
+    upstream.on("message", (data, binary) => { if (client.readyState === WebSocket.OPEN) client.send(data, { binary }); });
+    client.on("message", (data, binary) => { if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary }); });
+    client.on("close", (code, reason) => closeBoth(code, reason.toString()));
+    upstream.on("close", (code, reason) => { closed = true; if (client.readyState === WebSocket.OPEN) client.close(code, reason); });
+    client.on("error", () => closeBoth(1011, "client error"));
+    upstream.on("error", () => closeBoth(1011, "upstream error"));
+  });
+}
+
+async function handleRequest(req, res) {
+  const url = new URL(req.url, "http://localhost");
+  if (url.pathname === "/health") {
+    res.writeHead(200, {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-robots-tag": "noindex, nofollow, noarchive",
+      "access-control-allow-origin": "*"
+    });
+    res.end(JSON.stringify({ status: "ok", version: "0.4.0" }));
+    return;
+  }
+  if (url.pathname === "/robots.txt") {
+    res.writeHead(200, {
+      "content-type": "text/plain; charset=utf-8",
+      "cache-control": "no-store",
+      "x-robots-tag": "noindex, nofollow, noarchive"
+    });
+    res.end("User-agent: *\nDisallow: /\n");
+    return;
+  }
+  if (url.pathname === "/service-worker.js") {
+    const response = serviceWorkerResponse();
+    res.writeHead(response.status, Object.fromEntries(response.headers));
+    res.end(await response.text());
+    return;
+  }
+  if (url.pathname === "/api/icon") {
+    const rawTarget = url.searchParams.get("url");
+    const target = await validateTarget(rawTarget, allowPrivate);
+    if (!target) return sendError(res, 403, "Target is not allowed");
+    const icon = await fetchSiteIcon(target.href);
+    res.writeHead(icon ? 200 : 404, {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "public, max-age=3600",
+      "x-robots-tag": "noindex, nofollow, noarchive",
+      "access-control-allow-origin": "*"
+    });
+    res.end(JSON.stringify(icon ? {
+      url: target.href,
+      icon: `/favicon?url=${encodeURIComponent(target.href)}`
+    } : { url: target.href, icon: null }));
+    return;
+  }
+  if (url.pathname === "/favicon") {
+    const rawTarget = url.searchParams.get("url") || (url.searchParams.has("q") ? `https://www.google.com/search?q=${encodeURIComponent(url.searchParams.get("q") || "")}` : null);
+  const target = await validateTarget(rawTarget, allowPrivate);
+    if (!target) return sendError(res, 403, "Target is not allowed");
+    const icon = await fetchSiteIcon(target.href);
+    if (!icon) return sendError(res, 404, "Website icon not found");
+    res.writeHead(200, {
+      "content-type": String(icon.contentType).split(";")[0] || "application/octet-stream",
+      "cache-control": "public, max-age=3600",
+      "x-robots-tag": "noindex, nofollow, noarchive",
+      "access-control-allow-origin": "*",
+      "content-length": String(icon.body.length)
+    });
+    res.end(icon.body);
+    return;
+  }
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS",
+      "access-control-allow-headers": "*",
+      "access-control-max-age": "86400"
+    });
+    res.end();
+    return;
+  }
+  // Serve frontend landing page
+  if (url.pathname === "/" || url.pathname === "/index.html") {
+    try {
+      const __dirname = path.dirname(fileURLToPath(import.meta.url));
+      const htmlPath = path.join(__dirname, "..", "index.html");
+      const html = fs.readFileSync(htmlPath);
+      res.writeHead(200, {
+        "content-type": "text/html; charset=utf-8",
+        "cache-control": "no-store",
+        "x-robots-tag": "noindex, nofollow, noarchive"
+      });
+      res.end(html);
+    } catch {
+      sendError(res, 500, "Frontend not found");
+    }
+    return;
+  }
+  if (url.pathname !== "/artemis") return sendError(res, 404, "Not found");
+  const redirectCount = Number(url.searchParams.get("__artemis_redirects")) || 0;
+  if (redirectCount > maxRedirects) return sendError(res, 508, "Too many redirects");
+  const target = await validateTarget(resolveProxyTarget(url.searchParams), allowPrivate);
+  if (!target) return sendError(res, 403, "Target is not allowed");
+  await proxyRequest(req, res, target, redirectCount);
+}
+
+server.on("upgrade", (req, socket, head) => {
+  const pathname = new URL(req.url, "http://localhost").pathname;
+  if (pathname === wispPath) {
+    req.url = wispPath;
+    wisp.routeRequest(req, socket, head);
+    return;
+  }
+  if (pathname !== "/ws") return socket.destroy();
+  handleWebSocket(req, socket, head);
+});
+
+server.headersTimeout = timeout + 5000;
+server.requestTimeout = 0;
+server.keepAliveTimeout = 65000;
+
+export { server, handleRequest };
